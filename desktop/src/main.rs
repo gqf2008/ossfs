@@ -45,6 +45,15 @@ struct ReleaseInfo {
     url: String,
 }
 
+/// HTTP 超时策略(issue #87 修复):
+/// - 必须用 per-read 超时而非整体超时。旧实现 `AgentBuilder::timeout(30s)`
+///   是 ureq 的"整体请求超时"(DNS+连接+读完整 body),国内到 GitHub CDN
+///   实测 ~0.6MB/s,43MB DMG 需 ~70s,30s 就被掐断 → 误判下载失败 → fallback
+///   打开浏览器页面(用户看到的"打开页面"现象)。
+/// - per-read 30s:只要数据持续到达就不会被打断;真正卡死(30s 无数据)才失败。
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn fetch_latest_release() -> Option<ReleaseInfo> {
     let resp = build_http_agent()
         .get("https://api.github.com/repos/gqf2008/ossfs/releases/latest")
@@ -59,8 +68,11 @@ fn fetch_latest_release() -> Option<ReleaseInfo> {
 
 /// 构建 HTTP agent(读 HTTPS_PROXY/https_proxy 环境变量;ureq 2 的便捷
 /// 函数不自动读 env 代理,需显式 Proxy——中国网络到 GitHub 需走代理)。
+/// 只设 per-read/connect 超时,不设整体超时(见 HTTP_*_TIMEOUT 注释)。
 fn build_http_agent() -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30));
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(HTTP_CONNECT_TIMEOUT)
+        .timeout_read(HTTP_READ_TIMEOUT);
     for var in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
         if let Ok(p) = std::env::var(var)
             && let Ok(proxy) = ureq::Proxy::new(&p)
@@ -2317,6 +2329,21 @@ mod tests {
             "https://x/exe"
         };
         assert_eq!(url.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn http_timeouts_avoid_overall_download_cap() {
+        // 回归(issue #87):旧实现用 ureq 整体超时 timeout(30s),慢速网络
+        // (国内→GitHub CDN ~0.6MB/s)下载 43MB DMG 约需 70s,30s 即被掐断,
+        // 误判下载失败并 fallback 打开浏览器页面。修复后必须为 per-read
+        // 超时(数据持续到达即不中断)且不设整体超时。
+        // 注:这是弱守卫(常量断言,防不住实现退回整体超时);真正的回归守卫是
+        // 其余 replace_app/parse_mount_point 等测试 + 本机/CI 实测下载。
+        assert!(
+            HTTP_READ_TIMEOUT <= Duration::from_secs(60),
+            "per-read 超时不宜过长"
+        );
+        assert!(HTTP_CONNECT_TIMEOUT < HTTP_READ_TIMEOUT);
     }
 
     #[test]
