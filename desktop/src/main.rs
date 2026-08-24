@@ -20,12 +20,13 @@ mod winutil;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use slint::{ModelRc, SharedString, Timer, TimerMode, VecModel};
 
-// 版本更新检查(issue #87):GET GitHub Releases 最新版,与当前版本对比,
-// 发现新版提示下载。网络失败/解析失败静默(不打扰用户)。
+// 版本更新检查(issue #87):启动/手动检查 GitHub Releases,发现新版后
+// 自动下载并自安装——不弹浏览器页面(下载失败重试,不 fallback 打开网页)。
 
 /// 解析 "v0.4.2" 或 "0.4.2" → (0,4,2)。非数字段返回 None。
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
@@ -53,6 +54,18 @@ struct ReleaseInfo {
 /// - per-read 30s:只要数据持续到达就不会被打断;真正卡死(30s 无数据)才失败。
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// 下载重试:失败后按 5s/10s 退避最多 3 次,仍失败则保留状态、不弹页面,
+/// 下次启动/手动「检查更新」自动重试。
+const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
+const DOWNLOAD_RETRY_BASE_SECS: u64 = 5;
+/// 新阈值落地即带验证:下载至少重试一次而非直接放弃(规则可执行性)。
+const _: () = assert!(
+    DOWNLOAD_MAX_ATTEMPTS >= 2,
+    "下载失败应至少重试一次而非直接放弃"
+);
+/// 更新检查防重入:启动自动检查与手动「检查更新」并发触发时只跑一个,
+/// 避免并发下载/并发安装写同一临时文件(issue #87 加固)。
+static UPDATE_CHECK_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 fn fetch_latest_release() -> Option<ReleaseInfo> {
     let resp = build_http_agent()
@@ -106,13 +119,8 @@ fn check_for_update(current: &str) -> Option<ReleaseInfo> {
     (l > c).then_some(release)
 }
 
-/// 打开 GitHub release 下载页(手动 fallback)。
-fn open_release_page() {
-    let _ = webbrowser::open("https://github.com/gqf2008/ossfs/releases/latest");
-}
-
-/// 下载安装包到临时目录。返回本地路径,失败返回 None。
-fn download_installer(url: &str, version: &str) -> Option<std::path::PathBuf> {
+/// 下载安装包到临时目录。返回本地路径;失败返回 Err(带原因)并清理半成品。
+fn download_installer(url: &str, version: &str) -> Result<std::path::PathBuf, String> {
     let ext = if cfg!(target_os = "macos") {
         "dmg"
     } else {
@@ -125,75 +133,245 @@ fn download_installer(url: &str, version: &str) -> Option<std::path::PathBuf> {
         .get(url)
         .set("User-Agent", "ossfs-tray")
         .call()
-        .map_err(|e| eprintln!("download connect failed: {e}"))
-        .ok()?;
-    use std::io::Write;
-    let mut file = std::fs::File::create(&path)
-        .map_err(|e| eprintln!("create file failed: {e}"))
-        .ok()?;
+        .map_err(|e| format!("请求失败:{e}"))?;
+    let mut file = std::fs::File::create(&path).map_err(|e| format!("创建文件失败:{e}"))?;
     let mut reader = resp.into_reader();
-    std::io::copy(&mut reader, &mut file)
-        .map_err(|e| eprintln!("copy bytes failed: {e}"))
-        .ok()?;
+    std::io::copy(&mut reader, &mut file).map_err(|e| {
+        // 清理半成品,避免残留占空间(下次下载会截断覆盖,但留着不干净)。
+        let _ = std::fs::remove_file(&path);
+        format!("写入失败:{e}")
+    })?;
     eprintln!("downloaded to {}", path.display());
-    Some(path)
+    Ok(path)
 }
 
-/// 运行安装包(程序内自安装,不引导用户):
-/// - macOS:`hdiutil attach` → `cp -R OSSFS.app /Applications/` → `detach` →
-///   spawn 新 tray + 退出当前(覆盖式更新,挂载进程不受影响)。
+/// 第 `attempt` 次重试前的退避时长(5s/10s,线性退避)。
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(DOWNLOAD_RETRY_BASE_SECS * u64::from(attempt))
+}
+
+/// 下载安装包,失败按退避重试(慢速网络/瞬时抖动)。全部失败返回 Err(带
+/// 最后一次失败原因);绝不 fallback 打开浏览器页面(issue #87 修复)。
+fn download_installer_with_retry(url: &str, version: &str) -> Result<std::path::PathBuf, String> {
+    let mut last_err = String::from("未知错误");
+    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        match download_installer(url, version) {
+            Ok(path) => return Ok(path),
+            Err(e) => {
+                last_err = format!("第 {attempt}/{DOWNLOAD_MAX_ATTEMPTS} 次:{e}");
+                eprintln!("download attempt failed: {last_err}");
+                if attempt < DOWNLOAD_MAX_ATTEMPTS {
+                    std::thread::sleep(retry_delay(attempt));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// 用 `src`(挂载盘里的 .app)整体替换 `dest`(如 /Applications/OSSFS.app)。
+/// 修复:旧实现 `cp -R src dest` 在 dest 已存在时会产生 `dest/src` 嵌套,
+/// /Applications/OSSFS.app 永远不会被替换——自动更新形同虚设(issue #87)。
+fn replace_app(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "dest 缺少父目录"))?;
+    let name = dest
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "dest 缺少文件名"))?;
+    let tmp = parent.join(format!(
+        ".{}.new-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let backup = parent.join(format!(
+        ".{}.bak-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    // 先拷到临时目录再原子换入:拷贝失败时现有应用原样保留,不会半替换。
+    copy_dir_recursive(src, &tmp)?;
+    // 校验关键可执行文件存在,避免把残缺应用换进去。
+    if !tmp
+        .join("Contents")
+        .join("MacOS")
+        .join("ossfs-tray")
+        .is_file()
+    {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} 内缺少 Contents/MacOS/ossfs-tray", tmp.display()),
+        ));
+    }
+    if !dest.exists() {
+        return std::fs::rename(&tmp, dest);
+    }
+    if backup.exists() {
+        std::fs::remove_dir_all(&backup)?;
+    }
+    // 旧应用整体挪到备份名(原子),再换入新应用(原子);换入失败则回滚。
+    std::fs::rename(dest, &backup)?;
+    match std::fs::rename(&tmp, dest) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::rename(&backup, dest);
+            Err(e)
+        }
+    }
+}
+
+/// 递归拷贝目录,保留符号链接(macOS .app 包内可能含链接)。
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_symlink() {
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&from)?;
+                std::os::unix::fs::symlink(target, &to)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::copy(&from, &to)?;
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// 解析 `hdiutil attach` 输出中的挂载点。输出为 tab 分隔:
+/// `/dev/disk3s1 \t Apple_HFS \t /Volumes/OSSFS`;挂载点可能含空格,
+/// 不能按空白切(旧实现 split_whitespace 取末字段会把含空格路径切坏)。
+fn parse_mount_point(hdiutil_stdout: &str) -> Option<String> {
+    let last_line = hdiutil_stdout.lines().last()?;
+    if last_line.contains('\t') {
+        // tab 分隔格式:`/dev/disk3s1 \t Apple_HFS \t /Volumes/...`;挂载点可能含空格,
+        // 整行以 /dev/... 开头,不能按空白切,只能取 tab 分隔的末字段。
+        let fields: Vec<&str> = last_line
+            .split('\t')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        return fields
+            .last()
+            .copied()
+            .filter(|f| f.starts_with('/'))
+            .map(str::to_string);
+    }
+    // 旧格式空格分隔(无 tab):取以 / 开头的末字段。
+    last_line
+        .split_whitespace()
+        .last()
+        .filter(|f| f.starts_with('/'))
+        .map(str::to_string)
+}
+
+/// 运行安装包(程序内自安装,不弹浏览器、不引导用户):
+/// - macOS:`hdiutil attach` → 挂载点内找 *.app → `replace_app` 替换
+///   /Applications 下的应用 → detach → 拉起新 tray → 退出当前进程
+///   (覆盖式更新,挂载进程不受影响)。
 /// - Windows:`ShellExecute runas /passive`(WiX 静默安装)+ 退出 tray 让
-///   安装器写文件;安装后由 WiX 重启应用或用户手动启动(后续增强)。
+///   安装器写文件。
+///
+/// 返回 Err 时保持旧版本继续运行。
 #[cfg(target_os = "macos")]
-fn run_installer(path: &std::path::Path) {
-    use std::process::{Command, exit};
-    let path_str = match path.to_str() {
-        Some(s) => s,
-        None => return,
-    };
-    // 挂载 dmg(-nobrowse:不在 Finder 弹窗)。
-    let out = match Command::new("hdiutil")
+fn run_installer(path: &std::path::Path) -> Result<(), String> {
+    use std::process::Command;
+
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "安装包路径非 UTF-8".to_string())?;
+    let out = Command::new("hdiutil")
         .args(["attach", "-nobrowse", path_str])
         .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("hdiutil attach failed: {e}");
-            return;
+        .map_err(|e| format!("hdiutil attach 失败:{e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "hdiutil attach 失败(退出码 {}):{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mount = std::path::PathBuf::from(
+        parse_mount_point(&String::from_utf8_lossy(&out.stdout))
+            .ok_or_else(|| "无法解析 hdiutil 挂载点".to_string())?,
+    );
+    // 挂载点下找 .app:优先 OSSFS.app,回退任意 .app(不依赖 read_dir 顺序)。
+    let mut apps: Vec<std::path::PathBuf> = std::fs::read_dir(&mount)
+        .map_err(|e| format!("读取挂载点 {} 失败:{e}", mount.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension() == Some(std::ffi::OsStr::new("app")))
+        .collect();
+    apps.sort_by_key(|p| {
+        if p.file_name() == Some(std::ffi::OsStr::new("OSSFS.app")) {
+            0
+        } else {
+            1
         }
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // hdiutil 输出最后字段为挂载点(如 /Volumes/OSSFS)。
-    let mount = match stdout
-        .lines()
-        .last()
-        .and_then(|l| l.split_whitespace().last())
-    {
-        Some(m) => m.to_string(),
-        None => return,
-    };
-    eprintln!("mounted at {mount}");
-    // 拷贝 .app 到 /Applications(覆盖式更新;运行中的旧 tray 仍可用旧二进制
-    // 直到 exit,新 spawn 的是新版)。
-    let cp = Command::new("cp")
-        .args(["-R", &format!("{mount}/OSSFS.app"), "/Applications/"])
+    });
+    let app_src = apps
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("挂载点 {} 下未找到 .app", mount.display()))?;
+    let app_name = app_src
+        .file_name()
+        .ok_or_else(|| "应用名解析失败".to_string())?;
+    let app_dest = std::path::Path::new("/Applications").join(app_name);
+    replace_app(&app_src, &app_dest)
+        .map_err(|e| format!("替换 {} 失败:{e}", app_dest.display()))?;
+    eprintln!("replaced {} from {}", app_dest.display(), app_src.display());
+    let detach = Command::new("hdiutil")
+        .args(["detach", &mount.to_string_lossy()])
         .status();
-    eprintln!("cp -R status: {:?}", cp);
-    // 卸载 dmg。
-    let _ = Command::new("hdiutil").args(["detach", &mount]).status();
-    // 重启:spawn 新 tray(/Applications/OSSFS.app)+ 退出当前。
-    let _ = Command::new("/Applications/OSSFS.app/Contents/MacOS/ossfs-tray")
-        .env(
-            "OSSMOUNT_EXE",
-            "/Applications/OSSFS.app/Contents/MacOS/ossmount",
-        )
-        .spawn();
-    exit(0);
+    if let Ok(status) = detach
+        && !status.success()
+    {
+        eprintln!("hdiutil detach 失败:{status}(挂载点可能残留,下次 attach 可能报 busy)");
+    }
+    // 拉起新 tray 后退出当前进程(旧进程二进制已被替换,但运行中进程不受影响)。
+    let mut new_tray = Command::new(app_dest.join("Contents/MacOS/ossfs-tray"))
+        .env("OSSMOUNT_EXE", app_dest.join("Contents/MacOS/ossmount"))
+        .spawn()
+        .map_err(|e| format!("拉起新 tray 失败:{e}"))?;
+    // 短暂确认新进程 exec 成功:若立即退出说明二进制缺失/签名损坏,保留旧进程。
+    // 轮询 ≤500ms:新进程仍在运行则视为启动成功,退出旧进程。
+    let mut exited_early = None;
+    for _ in 0..10 {
+        match new_tray.try_wait() {
+            Ok(Some(status)) => {
+                exited_early = Some(status);
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("等待新 tray 状态失败:{e}")),
+        }
+    }
+    if let Some(status) = exited_early {
+        return Err(format!("新 tray 启动后立即退出:{status}"));
+    }
+    std::process::exit(0);
 }
 
-/// 非 macOS(Windows):ShellExecute runas /passive + 退出。
+/// 非 macOS(Windows):ShellExecute runas /passive 静默安装 + 退出。
 #[cfg(windows)]
-fn run_installer(path: &std::path::Path) {
+fn run_installer(path: &std::path::Path) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let op: Vec<u16> = "runas\0".encode_utf16().collect();
@@ -203,7 +381,7 @@ fn run_installer(path: &std::path::Path) {
         .chain(std::iter::once(0))
         .collect();
     let params: Vec<u16> = "/passive\0".encode_utf16().collect();
-    unsafe {
+    let result = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             op.as_ptr(),
@@ -211,7 +389,17 @@ fn run_installer(path: &std::path::Path) {
             params.as_ptr(),
             std::ptr::null(),
             SW_SHOWNORMAL,
-        );
+        )
+    };
+    let code = result as isize;
+    // ShellExecuteW 失败返回 ≤32 的错误码;1223=ERROR_CANCELLED(用户取消
+    // UAC 提权),同样视为失败——不能让托盘静默退出且无任何反馈。
+    if code <= 32 || code == 1223 {
+        return Err(if code == 1223 {
+            "安装被取消(用户拒绝 UAC 提权)".to_string()
+        } else {
+            format!("ShellExecuteW 启动安装器失败(错误码 {result:?})")
+        });
     }
     // 退出 tray 让 WiX 安装器写文件(替换 ossfs-tray/ossmount)。
     std::process::exit(0);
@@ -219,102 +407,49 @@ fn run_installer(path: &std::path::Path) {
 
 /// Linux:tray 可编译但无安装包(release 仅 dmg/exe),不自动更新。
 #[cfg(target_os = "linux")]
-fn run_installer(_path: &std::path::Path) {
-    eprintln!("auto-update not supported on Linux (no installer asset)");
+fn run_installer(_path: &std::path::Path) -> Result<(), String> {
+    Err("Linux 无安装包,不支持自动更新".to_string())
 }
 
-/// 发现新版弹提示:确认后打开下载页。
-#[cfg(windows)]
-fn show_update_dialog(current: &str, latest: &str) {
-    let msg = format!("发现新版本 {latest}(当前 {current})。\n\n是否打开下载页面?",);
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IDYES, MB_ICONINFORMATION, MB_YESNO, MessageBoxW,
-    };
-    let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    let title: Vec<u16> = "OSSFS 更新"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let choice = unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            wide.as_ptr(),
-            title.as_ptr(),
-            MB_YESNO | MB_ICONINFORMATION,
-        )
-    };
-    if choice == IDYES {
-        open_release_page();
-    }
+/// 更新状态回写托盘菜单(Slint 跨线程纪律)。
+fn set_update_status(tray_weak: &slint::Weak<Tray>, text: String) {
+    let _ = tray_weak.upgrade_in_event_loop(move |tray| tray.set_update_status(text.into()));
 }
 
-/// 非 Windows 平台:直接打开下载页(无原生消息框)。
-#[cfg(not(windows))]
-fn show_update_dialog(_current: &str, latest: &str) {
-    eprintln!("OSSFS update available: {latest}");
-    open_release_page();
-}
-
-/// 下载完成提示安装:Windows MessageBox「下载完成,是否立即安装?」。
-#[cfg(windows)]
-fn show_install_prompt(version: &str, path: &std::path::Path) -> bool {
-    let msg = format!("新版本 {version} 已下载完成。\n\n是否立即安装?(安装会关闭托盘)",);
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IDYES, MB_ICONINFORMATION, MB_YESNO, MessageBoxW,
-    };
-    let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    let title: Vec<u16> = "OSSFS 更新"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let choice = unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            wide.as_ptr(),
-            title.as_ptr(),
-            MB_YESNO | MB_ICONINFORMATION,
-        )
-    };
-    let _ = path; // path 用于后续安装(此函数仅询问)
-    choice == IDYES
-}
-
-#[cfg(not(windows))]
-fn show_install_prompt(_version: &str, _path: &std::path::Path) -> bool {
-    // 非 Windows:无原生消息框,下载完成直接自安装(run_installer 程序内
-    // 完成 hdiutil+cp+重启,不引导用户操作)。
-    true
-}
-
-/// 后台线程检查更新:发现新版 → 菜单显示「下载新版本」→ 自动下载 →
-/// 完成提示安装(Windows MessageBox;非 Windows 打开 dmg)。
+/// 后台线程检查更新:发现新版 → 菜单显示「下载新版本」→ 自动下载(失败重试,
+/// 不弹浏览器)→ 自动安装(macOS 替换 /Applications 后自启;Windows runas)。
 /// `quiet_on_none` 控制"无新版/失败"时是否静默(自动检查静默;手动检查
-/// 要告知结果)。UI 更新经 `upgrade_in_event_loop`(Slint 跨线程纪律)。
+/// 要告知结果)。
 fn run_update_check(current: String, quiet_on_none: bool, tray_weak: slint::Weak<Tray>) {
+    // 防重入:启动自动检查与手动「检查更新」并发触发时只跑一个。
+    if UPDATE_CHECK_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        eprintln!("update check already in flight; skip");
+        return;
+    }
     std::thread::spawn(move || {
+        let done = || UPDATE_CHECK_IN_FLIGHT.store(false, Ordering::SeqCst);
         match check_for_update(&current) {
             Some(release) => {
-                let version_dl = release.version.clone();
-                let _ = tray_weak.upgrade_in_event_loop(move |tray| {
-                    tray.set_update_status(format!("下载新版本 {version_dl}…").into());
-                });
-                let url = release.url.clone();
                 let version = release.version.clone();
-                if let Some(path) = download_installer(&url, &version) {
-                    let status = format!("有新版本({version})");
-                    let _ = tray_weak.upgrade_in_event_loop(move |tray| {
-                        tray.set_update_status(status.into());
-                    });
-                    if show_install_prompt(&version, &path) {
-                        run_installer(&path);
+                set_update_status(&tray_weak, format!("下载新版本 {version}…"));
+                match download_installer_with_retry(&release.url, &version) {
+                    Ok(path) => {
+                        set_update_status(&tray_weak, format!("有新版本({version}),正在安装…"));
+                        // 给事件循环一点时间渲染状态(Windows 上 run_installer
+                        // 会立刻 ShellExecute + exit)。
+                        std::thread::sleep(Duration::from_millis(300));
+                        if let Err(e) = run_installer(&path) {
+                            set_update_status(&tray_weak, format!("安装失败:{e}"));
+                        }
+                        // 成功路径:run_installer 内已 exit(0),不会执行到这里。
+                        done();
                     }
-                } else {
-                    // 下载失败:fallback 打开下载页。
-                    let status = format!("有新版本({version})");
-                    let _ = tray_weak.upgrade_in_event_loop(move |tray| {
-                        tray.set_update_status(status.into());
-                    });
-                    show_update_dialog(&current, &version);
+                    Err(reason) => {
+                        // 不再自动打开浏览器页面:保留现状,下次启动或手动
+                        // 「检查更新」会自动重试(issue #87 修复)。
+                        set_update_status(&tray_weak, format!("更新失败({reason})"));
+                        done();
+                    }
                 }
             }
             None if !quiet_on_none => {
@@ -347,8 +482,9 @@ fn run_update_check(current: String, quiet_on_none: bool, tray_weak: slint::Weak
                 {
                     eprintln!("OSSFS update check: no update or check failed");
                 }
+                done();
             }
-            None => {}
+            None => done(),
         }
     });
 }
@@ -1329,7 +1465,8 @@ fn wire_callbacks(
         let tray_weak = tray.as_weak();
         move || run_update_check(current.clone(), false, tray_weak.clone())
     });
-    // 自动:启动后异步检查,仅发现新版时提示(网络失败静默)。
+    // 自动:启动后异步检查。"静默"仅指无新版/检查失败时不打扰用户;发现新版
+    // 即自动下载安装,下载失败会在菜单状态显示并自动重试(issue #87)。
     run_update_check(env!("CARGO_PKG_VERSION").to_string(), true, tray.as_weak());
 }
 
@@ -2344,6 +2481,95 @@ mod tests {
             "per-read 超时不宜过长"
         );
         assert!(HTTP_CONNECT_TIMEOUT < HTTP_READ_TIMEOUT);
+    }
+
+    #[test]
+    fn retry_delay_linear_backoff() {
+        assert_eq!(retry_delay(1), Duration::from_secs(5));
+        assert_eq!(retry_delay(2), Duration::from_secs(10));
+        assert_eq!(retry_delay(3), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn replace_app_replaces_not_nests() {
+        // 回归(issue #87):旧实现 cp -R src dest(dest 已存在)→ dest/src/... 嵌套,
+        // /Applications/OSSFS.app 永远不被替换,自动更新形同虚设。
+        let dir =
+            std::env::temp_dir().join(format!("ossfs-replace-app-test-{}", std::process::id()));
+        let src = dir.join("OSSFS.app");
+        let dest = dir.join("Applications").join("OSSFS.app");
+        let old_bin = dest.join("Contents/MacOS/ossfs-tray");
+        let stale = dest.join("stale.txt");
+        let new_bin = src.join("Contents/MacOS/ossfs-tray");
+        std::fs::create_dir_all(old_bin.parent().unwrap()).unwrap();
+        std::fs::write(&old_bin, "old").unwrap();
+        std::fs::write(&stale, "stale").unwrap();
+        std::fs::create_dir_all(new_bin.parent().unwrap()).unwrap();
+        std::fs::write(&new_bin, "new").unwrap();
+        std::fs::write(src.join("Info.plist"), "plist").unwrap();
+
+        replace_app(&src, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("Contents/MacOS/ossfs-tray")).unwrap(),
+            "new",
+            "dest 必须被 src 内容替换"
+        );
+        assert!(!dest.join("OSSFS.app").exists(), "不得产生 dest/src 嵌套");
+        assert!(!stale.exists(), "旧版本残留文件应被清除");
+        assert!(dest.join("Info.plist").exists());
+        // 原子替换不得残留临时/备份目录。
+        let residue: Vec<String> = std::fs::read_dir(dir.join("Applications"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".new-") || n.contains(".bak-"))
+            .collect();
+        assert!(residue.is_empty(), "不应残留临时/备份目录:{residue:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_preserves_symlinks() {
+        let dir =
+            std::env::temp_dir().join(format!("ossfs-copy-symlink-test-{}", std::process::id()));
+        let src = dir.join("src");
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::write(src.join("lib/lib.dylib"), "lib").unwrap();
+        std::os::unix::fs::symlink("lib/lib.dylib", src.join("lib-link")).unwrap();
+
+        copy_dir_recursive(&src, &dest).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(dest.join("lib-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "符号链接应被保留而非跟随拷贝"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_mount_point_handles_tabs_and_spaces() {
+        // hdiutil attach 输出 tab 分隔;挂载点可能含空格,不能按空白切。
+        assert_eq!(
+            parse_mount_point("/dev/disk3s1\tApple_HFS\t/Volumes/OSSFS\n").as_deref(),
+            Some("/Volumes/OSSFS")
+        );
+        assert_eq!(
+            parse_mount_point("/dev/disk3s1\tApple_HFS\t/Volumes/OSSFS 0.4.7\n").as_deref(),
+            Some("/Volumes/OSSFS 0.4.7")
+        );
+        // 旧格式空格分隔的兼容回退。
+        assert_eq!(
+            parse_mount_point("/dev/disk3s1 Apple_HFS /Volumes/OSSFS\n").as_deref(),
+            Some("/Volumes/OSSFS")
+        );
+        assert_eq!(parse_mount_point(""), None);
+        assert_eq!(parse_mount_point("hdiutil: attach failed\n"), None);
     }
 
     #[test]
