@@ -249,7 +249,7 @@ impl ReplyEntry {
 ///
 #[derive(Debug)]
 pub struct ReplyAttr {
-    reply: ReplyRaw,
+    pub reply: ReplyRaw,
 }
 
 impl Reply for ReplyAttr {
@@ -364,7 +364,7 @@ impl ReplyOpen {
 ///
 #[derive(Debug)]
 pub struct ReplyWrite {
-    reply: ReplyRaw,
+    pub reply: ReplyRaw,
 }
 
 impl Reply for ReplyWrite {
