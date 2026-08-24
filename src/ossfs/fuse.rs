@@ -652,6 +652,30 @@ impl Filesystem for OssFs {
             // read-modify-write so truncate() on an unopened file works.
             let mut handled = false;
             if let Some(fh) = fh {
+                // #90 review C1: ftruncate on a streaming handle is
+                // unsupported. The multipart stream is append-only and there
+                // is no spool to replay truncated bytes (unlike WinFsp), so
+                // mutating logical_size would desync it from the true stream
+                // end — the next write would pass the #89 append-only guard
+                // and silently corrupt the object. Reject loudly; the stream
+                // stays intact and finishes on flush. The rejection is
+                // unconditional while a stream is live (even a no-op
+                // ftruncate to the current size), because the stream end is
+                // authoritative, not the declared size.
+                let stream = {
+                    let guard = self.files.lock().unwrap();
+                    guard.get(&fh.0).map(|o| o.stream.clone())
+                };
+                if let Some(stream) = stream
+                    && self.block_on(async { stream.lock().await.is_some() })
+                {
+                    warn!(
+                        path = %path,
+                        "ossfs setattr rejected: streaming handle is append-only"
+                    );
+                    reply.error(Errno::EIO);
+                    return;
+                }
                 // Lazily load original content before truncating an open
                 // write handle. Truncating to 0 needs no original bytes at
                 // all (the empty buffer is authoritative), so skip the fetch
@@ -738,6 +762,27 @@ impl Filesystem for OssFs {
                 {
                     warn!(path = %path, error = ?e, "ossfs setattr dirty budget failed");
                     reply.error(self.errno_for(&e, true));
+                    return;
+                }
+                // #90 review (second pass): re-check the stream right before
+                // the mutation — the early check above is separated from this
+                // point by the lazy-load round trip, and a concurrent write's
+                // streaming switch in that window would make this truncate
+                // desync logical_size from the true stream end again. (The
+                // kernel serializes same-inode ops, so this is defense-in-
+                // depth, mirroring the write-side live re-read.)
+                let stream = {
+                    let guard = self.files.lock().unwrap();
+                    guard.get(&fh.0).map(|o| o.stream.clone())
+                };
+                if let Some(stream) = stream
+                    && self.block_on(async { stream.lock().await.is_some() })
+                {
+                    warn!(
+                        path = %path,
+                        "ossfs setattr rejected at commit: streaming handle is append-only"
+                    );
+                    reply.error(Errno::EIO);
                     return;
                 }
                 {
@@ -1240,16 +1285,44 @@ impl Filesystem for OssFs {
             }
         }
         let new_size = (offset as usize).saturating_add(data.len());
-        if let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, new_size)) {
-            warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
-            reply.error(self.errno_for(&e, true));
-            return;
-        }
 
-        // Streaming multipart already active: feed it directly.
+        // Streaming multipart already active: feed it directly. Checked
+        // BEFORE the dirty-budget reservation so a rejected write cannot
+        // inflate the handle's high-water budget units (review M2).
         {
             let mut guard = self.block_on(async { open_snapshot.stream.lock().await });
             if let Some(up) = guard.as_mut() {
+                // #89: the streaming upload is append-only (multipart parts
+                // are assembled in feed order). A write anchored anywhere but
+                // the current end — out-of-order NFS write-back, an overlap,
+                // or a partial overwrite — would silently corrupt the object.
+                // Mirror the WinFsp adapter's guard (#47): reject it loudly
+                // instead of appending misplaced bytes. (A same-offset
+                // retransmit of the last acknowledged write is
+                // indistinguishable from a legitimate append and remains
+                // undetectable — an inherent property of append-only
+                // streaming, same as WinFsp.)
+                //
+                // Re-read the live end under the stream lock: Linux runs four
+                // fuser dispatcher threads, so the snapshot cloned above may
+                // be stale if another thread appended in between (review I1).
+                let live_size = self
+                    .files
+                    .lock()
+                    .unwrap()
+                    .get(&fh.0)
+                    .map(|o| o.logical_size)
+                    .unwrap_or(0);
+                if offset != live_size {
+                    warn!(
+                        path = %path,
+                        offset = offset,
+                        logical_size = live_size,
+                        "ossfs stream write rejected: not append-only"
+                    );
+                    reply.error(Errno::EIO);
+                    return;
+                }
                 if let Err(e) = self.block_on(up.write(data)) {
                     warn!(path = %path, error = ?e, "ossfs stream write failed");
                     reply.error(self.errno_for(&e, true));
@@ -1268,9 +1341,28 @@ impl Filesystem for OssFs {
             }
         }
 
+        if let Err(e) = self.block_on(self.reserve_dirty(&open_snapshot, new_size)) {
+            warn!(path = %path, error = ?e, "ossfs write dirty budget failed");
+            reply.error(self.errno_for(&e, true));
+            return;
+        }
+
         // Switch to streaming multipart once the buffer exceeds the in-memory
-        // threshold.
-        if new_size > WRITE_SPOOL_THRESHOLD {
+        // threshold — but only for a pure append (write anchored exactly at
+        // the current buffer length). A gapped or overlapping write (#89)
+        // cannot be expressed in the append-only stream; falling through to
+        // the buffer path keeps its offset semantics (zero-filled holes,
+        // in-place splice) correct instead of misplacing bytes. Note the
+        // buffer path materializes the whole range, so pathological sparse
+        // writers can grow it without bound when no `max_dirty_bytes` budget
+        // is configured (review I2; same whole-file model as before
+        // streaming, now reached only by non-append writes).
+        let existing_len = open_snapshot
+            .write_buf
+            .as_ref()
+            .map(|b| b.len())
+            .unwrap_or(0);
+        if new_size > WRITE_SPOOL_THRESHOLD && offset as usize == existing_len {
             let existing = open_snapshot.write_buf.clone();
             let mut up = match self.block_on(self.fs.begin_streaming_upload(&path)) {
                 Ok(u) => u,
@@ -1282,20 +1374,39 @@ impl Filesystem for OssFs {
             };
             if let Some(existing) = &existing
                 && !existing.is_empty()
+                && let Err(e) = self.block_on(up.write(existing))
             {
-                if let Err(e) = self.block_on(up.write(existing)) {
-                    warn!(path = %path, error = ?e, "ossfs stream write failed");
-                    reply.error(self.errno_for(&e, true));
-                    return;
-                }
+                warn!(path = %path, error = ?e, "ossfs stream write failed");
+                reply.error(self.errno_for(&e, true));
+                return;
             }
             if let Err(e) = self.block_on(up.write(data)) {
                 warn!(path = %path, error = ?e, "ossfs stream write failed");
                 reply.error(self.errno_for(&e, true));
                 return;
             }
+            // Install under the stream lock; abort and fail loudly if a
+            // concurrent dispatcher thread already installed a stream (only
+            // reachable with n_threads > 1 — the kernel serializes writes to
+            // one inode, so this is defensive, review I1).
             let stream = open_snapshot.stream.clone();
-            self.block_on(async move { *stream.lock().await = Some(up) });
+            let install = async {
+                let mut guard = stream.lock().await;
+                if guard.is_some() {
+                    return Err(up);
+                }
+                *guard = Some(up);
+                Ok(())
+            };
+            if let Err(up) = self.block_on(install) {
+                self.block_on(up.abort());
+                warn!(
+                    path = %path,
+                    "ossfs stream switch lost a race to a concurrent writer; aborted redundant upload"
+                );
+                reply.error(Errno::EIO);
+                return;
+            }
             let mut files = self.files.lock().unwrap();
             if let Some(o) = files.get_mut(&fh.0) {
                 o.write_buf = Some(Vec::new());
@@ -2544,6 +2655,335 @@ mod tests {
         assert!(
             !mock.objects.lock().unwrap().contains_key("dir/"),
             "empty dir marker must be deleted"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // #89: streaming writes are append-only — out-of-order/gapped writes
+    // must be rejected (or buffered), never silently appended
+    // -------------------------------------------------------------------
+
+    /// A fresh write handle with an empty authoritative buffer (what `create`
+    /// produces for a brand-new file): no lazy-load, streaming eligible.
+    fn fresh_write_handle(path: &str) -> OpenFile {
+        OpenFile {
+            path: path.to_string(),
+            is_dir: false,
+            write_buf: Some(Vec::new()),
+            loaded: true,
+            dirty: false,
+            budget_units: Arc::new(AtomicUsize::new(0)),
+            budget_permits: Arc::new(Mutex::new(Vec::new())),
+            stream: Arc::new(tokio::sync::Mutex::new(None)),
+            stream_failed: Arc::new(AtomicBool::new(false)),
+            logical_size: 0,
+        }
+    }
+
+    /// Reassemble multipart part bodies from the mock's recorded requests in
+    /// part-number order (mirrors ObjectFs' streaming tests).
+    fn reassemble_uploaded_parts(mock: &MockS3) -> Vec<u8> {
+        let lc = |t: &str| t.to_lowercase();
+        let mut parts: Vec<(i32, Vec<u8>)> = mock
+            .recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == "PUT" && lc(&r.target).contains("partnumber"))
+            .map(|r| {
+                let query = r.target.split('?').nth(1).unwrap_or("");
+                let part_no = query
+                    .split('&')
+                    .find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        k.eq_ignore_ascii_case("partnumber")
+                            .then(|| v.parse::<i32>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                (part_no, r.body.clone())
+            })
+            .collect();
+        parts.sort_by_key(|(n, _)| *n);
+        parts.into_iter().flat_map(|(_, b)| b).collect()
+    }
+
+    /// Drive a FUSE write callback on a dispatcher-like thread (write calls
+    /// block_on internally); returns the wire-header errno (0 = success,
+    /// negative = error).
+    fn drive_write(oss: Arc<OssFs>, fh: u64, offset: u64, data: Vec<u8>) -> i32 {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let reply = ReplyWrite {
+            reply: fuser::ReplyRaw {
+                unique: fuser::RequestId(0xdeadbeef),
+                sender: Some(fuser::ReplySender::Sync(tx)),
+            },
+        };
+        let header = Box::leak(Box::new(fuser::fuse_in_header {
+            len: 0,
+            opcode: 0,
+            unique: 0,
+            nodeid: 0,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            padding: 0,
+        }));
+        let req = fuser::Request::ref_cast(header);
+        let handle = std::thread::spawn(move || {
+            oss.write(
+                req,
+                INodeNo(1),
+                FileHandle(fh),
+                offset,
+                &data,
+                WriteFlags::empty(),
+                OpenFlags(0),
+                None,
+                reply,
+            );
+        });
+        let code = rx.recv().expect("write must always reply");
+        handle.join().expect("write thread must not panic");
+        code
+    }
+
+    /// Complete the handle's streaming upload / buffer PUT via flush_open on
+    /// a dispatcher-like thread.
+    fn drive_flush_open(oss: Arc<OssFs>, fh: u64) -> anyhow::Result<()> {
+        let handle = std::thread::spawn(move || {
+            let open = oss
+                .files
+                .lock()
+                .unwrap()
+                .get(&fh)
+                .cloned()
+                .expect("handle exists");
+            oss.flush_open(&open)
+        });
+        handle.join().expect("flush thread must not panic")
+    }
+
+    /// #89: once streaming starts, a write anchored anywhere but the current
+    /// end (out-of-order NFS write-back / retransmit / overlap) must be
+    /// rejected — the old code appended it, silently corrupting the object
+    /// with no error to the caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_write_out_of_order_rejected_not_appended() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::ZERO).await;
+        let oss = Arc::new(test_oss(port, None));
+        let fh = oss.alloc_fh();
+        oss.files
+            .lock()
+            .unwrap()
+            .insert(fh, fresh_write_handle("/f"));
+
+        let part = 8 * 1024 * 1024;
+        let tail = 4096usize;
+        let data: Vec<u8> = (0..(part + tail)).map(|i| (i % 251) as u8).collect();
+
+        // First sequential write crosses WRITE_SPOOL_THRESHOLD → streaming.
+        let code1 = drive_write(Arc::clone(&oss), fh, 0, data.clone());
+        assert_eq!(code1, 0, "first sequential write must succeed");
+
+        // A write back at offset 0 (overlap/retransmit) must be rejected.
+        let code2 = drive_write(Arc::clone(&oss), fh, 0, vec![0xFF]);
+        assert_eq!(
+            code2,
+            -(libc::EIO as i32),
+            "out-of-order write must be rejected with EIO, got {code2}"
+        );
+
+        drive_flush_open(Arc::clone(&oss), fh).expect("flush must succeed");
+        let reassembled = reassemble_uploaded_parts(&mock);
+        assert_eq!(
+            reassembled.len(),
+            part + tail,
+            "rejected write must not append bytes"
+        );
+        assert_eq!(reassembled, data, "uploaded content must match the source");
+    }
+
+    /// #89 positive control: strictly sequential appends through streaming
+    /// still assemble byte-exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_write_sequential_appends_assemble_correctly() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::ZERO).await;
+        let oss = Arc::new(test_oss(port, None));
+        let fh = oss.alloc_fh();
+        oss.files
+            .lock()
+            .unwrap()
+            .insert(fh, fresh_write_handle("/f"));
+
+        let part = 8 * 1024 * 1024;
+        let tail = 4096usize;
+        let data: Vec<u8> = (0..(part + tail)).map(|i| (i % 251) as u8).collect();
+
+        let code1 = drive_write(Arc::clone(&oss), fh, 0, data.clone());
+        assert_eq!(code1, 0);
+        let code2 = drive_write(Arc::clone(&oss), fh, (part + tail) as u64, data.clone());
+        assert_eq!(code2, 0, "sequential append must succeed");
+
+        drive_flush_open(Arc::clone(&oss), fh).expect("flush");
+        let reassembled = reassemble_uploaded_parts(&mock);
+        let expected: Vec<u8> = data.iter().chain(data.iter()).copied().collect();
+        assert_eq!(reassembled, expected, "sequential parts must reassemble");
+    }
+
+    /// #89: a gapped write (offset > current length) must NOT switch to the
+    /// append-only stream — that would place the byte at the wrong offset
+    /// and drop the zero-filled hole. It falls back to the whole-buffer path
+    /// whose offset semantics are correct.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_switch_gapped_write_falls_back_to_buffer() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::ZERO).await;
+        let oss = Arc::new(test_oss(port, None));
+        let fh = oss.alloc_fh();
+        oss.files
+            .lock()
+            .unwrap()
+            .insert(fh, fresh_write_handle("/f"));
+
+        // One byte at offset 8 MiB + 1: new_size crosses the spool threshold
+        // but the write is not an append from 0.
+        let gap_offset = 8 * 1024 * 1024 + 1;
+        let code = drive_write(Arc::clone(&oss), fh, gap_offset as u64, vec![0xAB]);
+        assert_eq!(code, 0, "gapped write succeeds through the buffer path");
+
+        drive_flush_open(Arc::clone(&oss), fh).expect("flush");
+        // Buffer path PUT (8 MiB + 2 < 16 MiB multipart threshold) lands the
+        // whole object, hole zero-filled, byte at the declared offset.
+        let objects = mock.objects.lock().unwrap();
+        let got = objects.get("f").expect("object uploaded via buffer PUT");
+        assert_eq!(got.len(), gap_offset + 1);
+        assert_eq!(got[gap_offset], 0xAB, "byte at its declared offset");
+        assert!(
+            got[..gap_offset].iter().all(|&b| b == 0),
+            "gap between 0 and the write must be zero-filled"
+        );
+    }
+
+    /// Drive the setattr(size) callback on a dispatcher-like thread; returns
+    /// the wire-header errno (0 = success, negative = error).
+    fn drive_setattr_size(oss: Arc<OssFs>, ino: u64, fh: u64, new_size: u64) -> i32 {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let reply = ReplyAttr {
+            reply: fuser::ReplyRaw {
+                unique: fuser::RequestId(0xdeadbeef),
+                sender: Some(fuser::ReplySender::Sync(tx)),
+            },
+        };
+        let header = Box::leak(Box::new(fuser::fuse_in_header {
+            len: 0,
+            opcode: 0,
+            unique: 0,
+            nodeid: 0,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            padding: 0,
+        }));
+        let req = fuser::Request::ref_cast(header);
+        let handle = std::thread::spawn(move || {
+            oss.setattr(
+                req,
+                INodeNo(ino),
+                None,
+                None,
+                None,
+                Some(new_size),
+                None,
+                None,
+                None,
+                Some(FileHandle(fh)),
+                None,
+                None,
+                None,
+                None,
+                reply,
+            );
+        });
+        let code = rx.recv().expect("setattr must always reply");
+        handle.join().expect("setattr thread must not panic");
+        code
+    }
+
+    /// #90 review C1: ftruncate on a streaming handle must be rejected —
+    /// mutating logical_size would desync it from the true stream end and
+    /// let the next write corrupt the object. The stream stays intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_setattr_truncate_rejected_stream_intact() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::ZERO).await;
+        mock.set_object("f", b"".to_vec());
+        let oss = Arc::new(test_oss(port, None));
+        let fh = oss.alloc_fh();
+        oss.files
+            .lock()
+            .unwrap()
+            .insert(fh, fresh_write_handle("/f"));
+        let ino = oss.register_inode("/f");
+
+        let part = 8 * 1024 * 1024;
+        let tail = 4096usize;
+        let data: Vec<u8> = (0..(part + tail)).map(|i| (i % 251) as u8).collect();
+
+        let code1 = drive_write(Arc::clone(&oss), fh, 0, data.clone());
+        assert_eq!(code1, 0, "streaming write must succeed");
+        assert!(
+            oss.files
+                .lock()
+                .unwrap()
+                .get(&fh)
+                .is_some_and(|o| o.stream.try_lock().is_ok_and(|g| g.is_some())),
+            "stream must be active"
+        );
+
+        // ftruncate to 4 MiB while the 8 MiB + 4 KiB stream is live.
+        let code = drive_setattr_size(Arc::clone(&oss), ino, fh, 4 * 1024 * 1024);
+        assert_eq!(
+            code,
+            -(libc::EIO as i32),
+            "ftruncate on a streaming handle must be rejected, got {code}"
+        );
+
+        // The stream is untouched: flush completes the original content.
+        drive_flush_open(Arc::clone(&oss), fh).expect("flush");
+        let reassembled = reassemble_uploaded_parts(&mock);
+        assert_eq!(reassembled, data, "stream content must be byte-exact");
+    }
+
+    /// #90 review M4a: the switch's `up.write(existing)` branch — a handle
+    /// that buffered below the threshold, then appends past it — must
+    /// reassemble byte-exactly (prefix + append).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streaming_switch_with_existing_buffer_reassembles() {
+        let (mock, port) = MockS3::start(Vec::new(), Duration::ZERO).await;
+        let oss = Arc::new(test_oss(port, None));
+        let fh = oss.alloc_fh();
+        oss.files
+            .lock()
+            .unwrap()
+            .insert(fh, fresh_write_handle("/f"));
+
+        let first: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let second: Vec<u8> = (0..(4 * 1024 * 1024 + 4096))
+            .map(|i| ((i + 123) % 251) as u8)
+            .collect();
+
+        // 5 MiB stays buffered (below WRITE_SPOOL_THRESHOLD).
+        let code1 = drive_write(Arc::clone(&oss), fh, 0, first.clone());
+        assert_eq!(code1, 0);
+        // Append of 4 MiB + 4 KiB crosses the threshold; offset == buffer
+        // length, so the switch feeds the existing buffer + this data.
+        let code2 = drive_write(Arc::clone(&oss), fh, first.len() as u64, second.clone());
+        assert_eq!(code2, 0, "append past threshold must succeed");
+
+        drive_flush_open(Arc::clone(&oss), fh).expect("flush");
+        let reassembled = reassemble_uploaded_parts(&mock);
+        let expected: Vec<u8> = first.iter().chain(second.iter()).copied().collect();
+        assert_eq!(
+            reassembled, expected,
+            "existing buffer + append must reassemble"
         );
     }
 }
