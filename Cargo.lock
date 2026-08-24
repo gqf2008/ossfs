@@ -4501,7 +4501,7 @@ dependencies = [
 
 [[package]]
 name = "ossfs"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -4527,7 +4527,7 @@ dependencies = [
 
 [[package]]
 name = "ossfs-tray"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "dirs",
  "embed-resource",

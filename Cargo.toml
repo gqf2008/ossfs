@@ -1,6 +1,6 @@
 [package]
 name = "ossfs"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 authors = ["rk8s-dev team"]
 description = "Mount an S3-compatible bucket (Aliyun OSS, MinIO, ...) as a local network drive with no local metadata database"

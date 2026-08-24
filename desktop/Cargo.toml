@@ -1,6 +1,6 @@
 [package]
 name = "ossfs-tray"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 description = "Windows system-tray manager for OSSFS (Slint 1.17 UI)"
 license = "MIT"
