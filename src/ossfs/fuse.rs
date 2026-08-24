@@ -903,9 +903,21 @@ impl Filesystem for OssFs {
             return;
         };
         let path = join_path(&parent_path, name);
-        // The object store deletes a directory tree recursively (matching the
-        // WinFsp adapter's cleanup semantics), so `rm -rf` and Finder deletion
-        // work even when the kernel cannot empty the dir first.
+        // POSIX rmdir only succeeds on an empty directory. The kernel empties
+        // each level before the final rmdir of `rm -rf`, and Finder deletes
+        // children first too, so this does not regress either. A non-empty
+        // directory must fail ENOTEMPTY instead of silently wiping the whole
+        // subtree (review P1: a plain `rmdir dir` in a script was an
+        // unrecoverable recursive delete).
+        //
+        // The emptiness probe and the recursive delete are two non-atomic S3
+        // operations: a child created in between is still wiped (metadata-less
+        // object-store semantics; far narrower than the pre-fix unconditional
+        // wipe), and a child deleted in between yields a spurious ENOTEMPTY.
+        if self.block_on(self.fs.dir_has_children(&path)) {
+            reply.error(Errno::ENOTEMPTY);
+            return;
+        }
         if let Err(e) = self.block_on(self.fs.delete_dir_recursive(&path)) {
             warn!(path = %path, error = ?e, "ossfs rmdir failed");
             reply.error(self.errno_for(&e, true));
@@ -2429,5 +2441,109 @@ mod tests {
         let fs = test_fs_with_budget(port, 32, None);
         let oss = test_oss_with(fs);
         assert_eq!(oss.trashes_perm("/.Trashes", true), None);
+    }
+
+    /// POSIX rmdir on a non-empty directory must fail with ENOTEMPTY instead
+    /// of recursively deleting the whole subtree (review P1: a plain
+    /// `rmdir dir` silently wiped the entire tree because the adapter
+    /// delegated to delete_dir_recursive). `rm -rf` still works: the kernel
+    /// empties each directory before issuing the final rmdir.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rmdir_nonempty_dir_returns_enotempty() {
+        let (mock, port) =
+            MockS3::start(vec![("dir/sub/a.txt".to_string(), false)], Duration::ZERO).await;
+        mock.set_object("dir/sub/a.txt", b"data".to_vec());
+        let oss = test_oss(port, None);
+        // Register the inode so path_of(parent) resolves to "/dir".
+        oss.register_inode("/dir");
+        let parent = INodeNo(crate::ossfs::fuse::inode_for_path("/dir"));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let reply = ReplyEmpty {
+            reply: fuser::ReplyRaw {
+                unique: fuser::RequestId(0xdeadbeef),
+                sender: Some(fuser::ReplySender::Sync(tx)),
+            },
+        };
+        let header = Box::leak(Box::new(fuser::fuse_in_header {
+            len: 0,
+            opcode: 0,
+            unique: 0,
+            nodeid: 0,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            padding: 0,
+        }));
+        let req = fuser::Request::ref_cast(header);
+        // rmdir calls block_on internally; drive it off the tokio test
+        // runtime thread like a real FUSE dispatcher would.
+        let oss2 = std::sync::Arc::new(oss);
+        let oss3 = std::sync::Arc::clone(&oss2);
+        let name = std::ffi::OsString::from("sub");
+        let handle = std::thread::spawn(move || {
+            oss3.rmdir(req, parent, name.as_os_str(), reply);
+        });
+        let code = rx.recv().expect("rmdir must always reply");
+        handle.join().expect("rmdir thread must not panic");
+        // The Sync test-hook channel carries the wire-header errno (negative).
+        assert_eq!(code, -(libc::ENOTEMPTY as i32));
+        assert!(
+            mock.recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.method == "GET" && r.target.contains("list-type=2")),
+            "the emptiness probe LIST must have run before ENOTEMPTY"
+        );
+        assert!(
+            !mock
+                .recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.method == "DELETE" || r.method == "POST"),
+            "ENOTEMPTY must not delete anything"
+        );
+    }
+
+    /// Review C1: rmdir on an EMPTY directory (only its zero-byte marker
+    /// object exists) must succeed and delete the marker — the probe must
+    /// not count the directory's own marker as a child.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rmdir_empty_dir_succeeds_and_deletes_marker() {
+        let (mock, port) = MockS3::start(vec![("dir/".to_string(), false)], Duration::ZERO).await;
+        mock.set_object("dir/", b"".to_vec());
+        let oss = test_oss(port, None);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let reply = ReplyEmpty {
+            reply: fuser::ReplyRaw {
+                unique: fuser::RequestId(0xdeadbeef),
+                sender: Some(fuser::ReplySender::Sync(tx)),
+            },
+        };
+        let header = Box::leak(Box::new(fuser::fuse_in_header {
+            len: 0,
+            opcode: 0,
+            unique: 0,
+            nodeid: 0,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            padding: 0,
+        }));
+        let req = fuser::Request::ref_cast(header);
+        let oss2 = std::sync::Arc::new(oss);
+        let oss3 = std::sync::Arc::clone(&oss2);
+        let name = std::ffi::OsString::from("dir");
+        let handle = std::thread::spawn(move || {
+            oss3.rmdir(req, INodeNo(1), name.as_os_str(), reply);
+        });
+        let code = rx.recv().expect("rmdir must always reply");
+        handle.join().expect("rmdir thread must not panic");
+        assert_eq!(code, 0, "empty dir rmdir must succeed, got {code}");
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("dir/"),
+            "empty dir marker must be deleted"
+        );
     }
 }

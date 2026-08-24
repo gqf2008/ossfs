@@ -2902,9 +2902,37 @@ impl ObjectFs {
         }
     }
 
+    /// Public empty-check for the mount adapters' `rmdir`: POSIX requires
+    /// ENOTEMPTY on a non-empty directory, and the adapters have no other way
+    /// to distinguish "delete this tree" (WinFsp cleanup) from "the user
+    /// called rmdir" (FUSE). One `max_keys=1` probe; the limiter permit is
+    /// taken internally. Blocking on a busy limiter cannot deadlock the
+    /// dispatcher (permits are released by S3 completions, independent of it)
+    /// but can stall the whole mount for the request's duration under
+    /// saturation — the safe tradeoff for a delete gate.
+    pub async fn dir_has_children(&self, dir: &str) -> bool {
+        let probe = dir.trim_end_matches('/');
+        if probe.is_empty() {
+            // The root always has children unless the bucket is empty; let
+            // delete_dir_recursive decide — rmdir("/") is rejected by the
+            // kernel before it reaches us anyway.
+            return true;
+        }
+        match self.acquire().await {
+            Ok(_permit) => self.has_children_impl(probe).await.unwrap_or(true),
+            Err(_) => true,
+        }
+    }
+
     /// Cheap existence probe: does `dir` have any child object? Uses
     /// `max_keys = 1` so a missing implied directory costs one tiny request
     /// instead of a full listing. Caller must hold a limiter permit.
+    ///
+    /// `start_after` skips the directory's own zero-byte marker object
+    /// (`<dir>/`), which also matches the prefix: a marker-only directory is
+    /// empty and must be removable by `rmdir` (review C1). `start-after` is
+    /// exclusive, so the first real child (lexicographically greater than
+    /// `<dir>/`) is still returned.
     async fn has_children_impl(&self, dir: &str) -> Result<bool> {
         self.metrics.s3_lists.fetch_add(1, Ordering::Relaxed);
         let prefix = self.list_prefix(dir);
@@ -2913,6 +2941,7 @@ impl ObjectFs {
             .list_objects_v2()
             .bucket(&self.bucket)
             .prefix(&prefix)
+            .start_after(&prefix)
             .max_keys(1)
             .send()
             .await
@@ -10453,6 +10482,34 @@ mod s3_mock_tests {
                 .unwrap()
                 .contains_key(".Trashes/501/.DS_Store"),
             "真实对象不被删除(rmdir 失败语义)"
+        );
+    }
+
+    /// 审查 C1:空目录探测必须忽略目录自身的零字节 marker(`dir/`)——
+    /// 否则 marker-only 目录被误判"非空",rmdir/rm -rf 全失效。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dir_has_children_ignores_own_marker() {
+        // marker-only 目录 = 空
+        let entries = vec![("dir/".to_string(), false)];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("dir/", b"".to_vec());
+        let fs = test_fs(port, 32);
+        assert!(
+            !fs.dir_has_children("/dir").await,
+            "marker-only directory must be empty"
+        );
+        // marker + 真实子项 = 非空
+        let entries = vec![
+            ("dir/".to_string(), false),
+            ("dir/a.txt".to_string(), false),
+        ];
+        let (mock, port) = MockS3::start(entries, Duration::from_millis(1)).await;
+        mock.set_object("dir/", b"".to_vec());
+        mock.set_object("dir/a.txt", b"x".to_vec());
+        let fs = test_fs(port, 32);
+        assert!(
+            fs.dir_has_children("/dir").await,
+            "marker + child must be non-empty"
         );
     }
 

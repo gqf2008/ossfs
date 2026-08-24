@@ -639,15 +639,15 @@ pub(crate) struct fuse_fallocate_in {
 
 #[repr(C)]
 #[derive(Debug, FromBytes, KnownLayout, Immutable)]
-pub(crate) struct fuse_in_header {
-    pub(crate) len: u32,
-    pub(crate) opcode: u32,
-    pub(crate) unique: u64,
-    pub(crate) nodeid: u64,
-    pub(crate) uid: u32,
-    pub(crate) gid: u32,
-    pub(crate) pid: u32,
-    pub(crate) padding: u32,
+pub struct fuse_in_header {
+    pub len: u32,
+    pub opcode: u32,
+    pub unique: u64,
+    pub nodeid: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+    pub padding: u32,
 }
 
 #[repr(C)]

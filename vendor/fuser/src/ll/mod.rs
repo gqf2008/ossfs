@@ -2,7 +2,7 @@
 
 mod argument;
 pub(crate) mod flags;
-pub(crate) mod fuse_abi;
+pub mod fuse_abi;
 pub(crate) mod ioctl;
 pub(crate) mod ioslice_concat;
 pub(crate) mod notify;
@@ -53,7 +53,7 @@ macro_rules! no_xattr_doc {
 #[derive(Debug, Copy, Clone)]
 pub struct Errno(
     /// Positive value.
-    NonZeroI32,
+    pub(crate) NonZeroI32,
 );
 impl Errno {
     /// Operation not permitted
