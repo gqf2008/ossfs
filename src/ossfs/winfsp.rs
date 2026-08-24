@@ -3341,8 +3341,7 @@ mod tests {
         let (mock, port) =
             MockS3::start(vec![("dir/sub/a.txt".to_string(), false)], Duration::ZERO).await;
         mock.set_object("dir/sub/a.txt", b"data".to_vec());
-        let fs = test_fs(port, 32);
-        let (_fs, ctx) = test_mount(fs);
+        let (_fs, ctx) = test_mount(test_fs_with_budget(port, 32, None));
         let dir: &'static OssFileContext = Box::leak(Box::new(OssFileContext {
             path: Mutex::new("/dir".to_string()),
             is_dir: true,
