@@ -13,7 +13,7 @@ pub struct Request {
 
 impl Request {
     #[ref_cast_custom]
-    pub(crate) fn ref_cast(header: &fuse_in_header) -> &Request;
+    pub fn ref_cast(header: &fuse_in_header) -> &Request;
 
     /// Returns the unique identifier of this request
     #[inline]

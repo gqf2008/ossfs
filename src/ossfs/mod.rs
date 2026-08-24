@@ -2902,6 +2902,26 @@ impl ObjectFs {
         }
     }
 
+    /// Public empty-check for the mount adapters' `rmdir`: POSIX requires
+    /// ENOTEMPTY on a non-empty directory, and the adapters have no other way
+    /// to distinguish "delete this tree" (WinFsp cleanup) from "the user
+    /// called rmdir" (FUSE). One `max_keys=1` probe; the limiter permit is
+    /// taken internally because adapter call sites run on dispatcher threads
+    /// that must not block on a busy limiter.
+    pub async fn dir_has_children(&self, dir: &str) -> bool {
+        let probe = dir.trim_end_matches('/');
+        if probe.is_empty() {
+            // The root always has children unless the bucket is empty; let
+            // delete_dir_recursive decide — rmdir("/") is rejected by the
+            // kernel before it reaches us anyway.
+            return true;
+        }
+        match self.acquire().await {
+            Ok(_permit) => self.has_children_impl(probe).await.unwrap_or(true),
+            Err(_) => true,
+        }
+    }
+
     /// Cheap existence probe: does `dir` have any child object? Uses
     /// `max_keys = 1` so a missing implied directory costs one tiny request
     /// instead of a full listing. Caller must hold a limiter permit.

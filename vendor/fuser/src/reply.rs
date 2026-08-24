@@ -36,12 +36,13 @@ use crate::passthrough::BackingId;
 
 /// Generic reply callback to send data
 #[derive(Debug)]
-pub(crate) enum ReplySender {
+pub enum ReplySender {
     Channel(ChannelSender),
     #[cfg(test)]
     Assert(AssertSender),
-    #[cfg(test)]
-    Sync(std::sync::mpsc::SyncSender<()>),
+    /// Test hook: reply errors into an mpsc channel (used by ossfs adapter
+    /// unit tests to drive Filesystem callbacks without a kernel session).
+    Sync(std::sync::mpsc::SyncSender<i32>),
 }
 
 impl ReplySender {
@@ -51,9 +52,8 @@ impl ReplySender {
             ReplySender::Channel(sender) => sender.send(data),
             #[cfg(test)]
             ReplySender::Assert(sender) => sender.send(data),
-            #[cfg(test)]
             ReplySender::Sync(sender) => {
-                sender.send(()).unwrap();
+                sender.send(0).map_err(|e| std::io::Error::other(e))?;
                 Ok(())
             }
         }
@@ -65,7 +65,6 @@ impl ReplySender {
             ReplySender::Channel(sender) => sender.open_backing(fd),
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
-            #[cfg(test)]
             ReplySender::Sync(_) => unreachable!(),
         }
     }
@@ -99,11 +98,11 @@ pub(crate) trait Reply: Send + 'static {
 /// Raw reply
 ///
 #[derive(Debug)]
-pub(crate) struct ReplyRaw {
+pub struct ReplyRaw {
     /// Unique id of the request to reply to
-    unique: ll::RequestId,
+    pub unique: ll::RequestId,
     /// Closure to call for sending the reply
-    sender: Option<ReplySender>,
+    pub sender: Option<ReplySender>,
 }
 
 impl Reply for ReplyRaw {
@@ -121,12 +120,19 @@ impl ReplyRaw {
     pub(crate) fn send_ll_mut(&mut self, response: &impl Response) {
         assert!(self.sender.is_some());
         let sender = self.sender.take().unwrap();
+        // Test hook: carry the errno value through the Sync channel so
+        // adapter unit tests can assert the exact errno replied.
+        if let ReplySender::Sync(tx) = &sender {
+            let code = response.errno().map_or(0, |e| -(e.0.get()));
+            let _ = tx.send(code);
+            return;
+        }
         let res = response.with_iovec(self.unique, |iov| sender.send(iov));
         if let Err(err) = res {
             error!("Failed to send FUSE reply: {err}");
         }
     }
-    pub(crate) fn send_ll(mut self, response: &impl Response) {
+    pub fn send_ll(mut self, response: &impl Response) {
         self.send_ll_mut(response);
     }
 
@@ -153,7 +159,7 @@ impl Drop for ReplyRaw {
 ///
 #[derive(Debug)]
 pub struct ReplyEmpty {
-    reply: ReplyRaw,
+    pub reply: ReplyRaw,
 }
 
 impl Reply for ReplyEmpty {

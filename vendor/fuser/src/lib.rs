@@ -35,6 +35,9 @@ use crate::forget_one::ForgetOne;
 pub use crate::ll::Errno;
 pub use crate::ll::Generation;
 pub use crate::ll::RequestId;
+pub use crate::reply::ReplySender;
+pub use crate::reply::ReplyRaw;
+pub use crate::ll::fuse_abi::fuse_in_header;
 pub use crate::ll::TimeOrNow;
 pub use crate::ll::flags::copy_file_range_flags::CopyFileRangeFlags;
 pub use crate::ll::flags::fopen_flags::FopenFlags;
@@ -89,7 +92,7 @@ mod dev_fuse;
 #[cfg(feature = "experimental")]
 pub mod experimental;
 mod forget_one;
-mod ll;
+pub mod ll;
 mod mnt;
 mod notify;
 mod open_flags;

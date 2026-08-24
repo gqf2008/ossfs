@@ -616,6 +616,17 @@ impl OssMountContext {
             let path = context.path.lock().unwrap().clone();
             let is_dir = context.is_dir;
             let fs = Arc::clone(&self.fs);
+            // POSIX parity with the FUSE adapter: a directory delete that
+            // arrives via set_delete/cleanup (RemoveDirectory) must fail on a
+            // non-empty tree instead of silently wiping it. FILE_DELETE_ON_CLOSE
+            // on a directory the user emptied still deletes normally.
+            if is_dir && fs.dir_has_children(&path).await {
+                warn!(
+                    path = log_path(&path),
+                    "ossfs cleanup delete refused: directory not empty"
+                );
+                return;
+            }
             let result = if is_dir {
                 fs.delete_dir_recursive(&path).await
             } else {
@@ -3320,5 +3331,50 @@ mod tests {
             .await
             .expect("plain file");
         assert_eq!(sec.attributes, FILE_ATTRIBUTE_ARCHIVE);
+    }
+
+    /// POSIX parity (review P1): a directory delete via cleanup must refuse a
+    /// non-empty tree instead of recursively wiping it — mirrors the FUSE
+    /// rmdir ENOTEMPTY fix. The file branch and empty-dir branch are unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cleanup_nonempty_dir_delete_refused() {
+        let (mock, port) =
+            MockS3::start(vec![("dir/sub/a.txt".to_string(), false)], Duration::ZERO).await;
+        mock.set_object("dir/sub/a.txt", b"data".to_vec());
+        let fs = test_fs(port, 32);
+        let (_fs, ctx) = test_mount(fs);
+        let dir: &'static OssFileContext = Box::leak(Box::new(OssFileContext {
+            path: Mutex::new("/dir".to_string()),
+            is_dir: true,
+            write_buf: Mutex::new(Some(Vec::new())),
+            loaded: AtomicBool::new(true),
+            dirty: AtomicBool::new(false),
+            delete_on_close: AtomicBool::new(false),
+            capture_i: AtomicBool::new(false),
+            dir_buffer: DirBuffer::new(),
+            budget_units: AtomicUsize::new(0),
+            budget_permits: Mutex::new(Vec::new()),
+            spool_path: Mutex::new(None),
+            spool_size: AtomicU64::new(0),
+            stream: tokio::sync::Mutex::new(None),
+            stream_failed: AtomicBool::new(false),
+            logical_size: AtomicU64::new(0),
+        }));
+        ctx.cleanup_async(dir, None, 0).await; // no FspCleanupDelete flag → flush path
+        // Now with the delete flag: the non-empty dir must survive.
+        dir.delete_on_close.store(true, Ordering::Release);
+        ctx.cleanup_async(dir, None, 0).await;
+        assert!(
+            mock.objects.lock().unwrap().contains_key("dir/sub/a.txt"),
+            "non-empty directory must not be deleted"
+        );
+        assert!(
+            mock.recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r.method != "POST" && r.method != "DELETE"),
+            "refusal path must issue no delete requests"
+        );
     }
 }
