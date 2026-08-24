@@ -159,8 +159,9 @@ CLI: `--system-trash-dir NAME` / `--system-trash-uids N[,N...]` (macOS) /
   `flush` ignores `lock_owner`. Local `flock`/`fcntl` locking still works
   inside one machine via the kernel's page-cache-level locking; there is no
   cross-machine lock coordination.
-- `rmdir` recursively deletes the whole prefix under the directory (matching
-  the WinFsp adapter's cleanup semantics) instead of failing with
-  `ENOTEMPTY` on a non-empty directory — this is what makes `rm -rf` and
-  Finder deletion work, but plain `rmdir` on a non-empty directory also
-  succeeds.
+- `rmdir` on a non-empty directory fails with `ENOTEMPTY` (POSIX); `rm -rf`
+  and Finder/Explorer recursive deletes still work because the shell deletes
+  children first and the final `rmdir` lands on an empty directory.
+  **Windows note**: the WinFsp `cleanup` callback has no error return
+  channel, so a refused non-empty delete is a warn-only silent no-op — the
+  caller sees success while the directory remains.

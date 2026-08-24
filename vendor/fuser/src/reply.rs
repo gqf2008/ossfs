@@ -132,7 +132,7 @@ impl ReplyRaw {
             error!("Failed to send FUSE reply: {err}");
         }
     }
-    pub fn send_ll(mut self, response: &impl Response) {
+    pub(crate) fn send_ll(mut self, response: &impl Response) {
         self.send_ll_mut(response);
     }
 
